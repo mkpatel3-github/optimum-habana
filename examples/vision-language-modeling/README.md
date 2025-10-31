@@ -14,48 +14,98 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Vision Language Model Fine-tuning
+# Vision-Language Model Fine-tuning with LoRA
 
-Fine-tuning the library models for vision language modeling on a image + text dataset.
-Gemma3 fine-tuned using a vision language modeling (VLM) loss. You can find more information about the differences between those objectives in our [model summary](https://huggingface.co/transformers/model_summary.html).
+Fine-tuning vision-language models using Low-Rank Adaptation (LoRA) on Intel Gaudi HPUs. This approach provides parameter-efficient training of multimodal models while maintaining high performance. The script handles vision-text preprocessing, automatic dataset normalization, and supports both single-card and distributed multi-card training.
 
-The following examples will run on datasets hosted on our [hub](https://huggingface.co/datasets) or with your own
-text files for training and validation. We give examples of both below.
+Examples can run on datasets hosted on the [Hugging Face Hub](https://huggingface.co/datasets) or your own vision-text datasets. The framework supports datasets with image-text pairs in various formats and automatically handles train/validation splitting.
 
 ## Requirements
 
-First, you should install the requirements:
+First, install the requirements:
+
 ```bash
 pip install -r requirements.txt
 ```
 
-## Gemma3 vision language modeling
+## Fine-tuning
 
-The following examples fine-tune Gemma3 on ChartQA.
-
-
-### Single-card Fine-tuning (Gemma3)
+### Single Card (Lazy Mode)
 
 ```bash
-
-```
-
-### Multi-card Training (Gemma3)
-
-```bash
-PT_HPU_LAZY_MODE=0 python ../gaudi_spawn.py \
-    --world_size 8 --use_mpi run_lora_vlm.py \
+PT_HPU_LAZY_MODE=1 python run_lora_vlm.py \
     --model_name_or_path google/gemma-3-12b-it \
     --dataset_name HuggingFaceM4/ChartQA \
-    --num_train_epochs 1 \
+    --num_train_epochs 5 \
     --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 1 \
+    --do_train \
+    --do_eval \
+    --output_dir ./output_gemma3 \
+    --gaudi_config_name Habana/gpt2 \
+    --use_habana \
+    --lora_rank 16 \
+    --max_train_samples 128 \
+    --overwrite_output_dir \
+    --bf16 \
+    --use_lazy_mode \
+    --gradient_checkpointing
+```
+
+### Multi-Card (8 HPUs)
+
+```bash
+PT_HPU_LAZY_MODE=1 python ../gaudi_spawn.py \
+    --world_size 8 \
+    --use_mpi \
+    run_lora_vlm.py \
+    --model_name_or_path google/gemma-3-12b-it \
+    --dataset_name HuggingFaceM4/ChartQA \
+    --num_train_epochs 5 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 2 \
     --do_train \
     --output_dir ./output_gemma3 \
     --gaudi_config_name Habana/gpt2 \
     --use_habana \
-    --use_lazy_mode \
     --lora_rank 16 \
-    --max_train_samples 128 \
-    --bf16 \    
-    --throughput_warmup_steps 3
+    --max_train_samples 4096 \
+    --overwrite_output_dir \
+    --bf16 \
+    --logging_steps 50 \
+    --log_level info \
+    --save_steps 50 \
+    --report_to tensorboard \
+    --do_eval \
+    --gradient_checkpointing
 ```
+
+## Key Features
+
+- **LoRA Fine-tuning**: Parameter-efficient training of vision-language models
+- **Multi-modal Support**: Image and text input preprocessing with automatic schema detection
+- **Assistant-only Label Masking**: Trains only on assistant responses, not prompts
+- **Distributed Training**: Support for single-card and multi-card (8 HPUs) setups
+- **Flexible Execution**: Both Lazy and Eager execution modes
+- **Automatic Train/Val Split**: Auto-splits datasets without validation split
+- **Evaluation**: Computes perplexity and validation metrics
+
+## Supported Models
+
+- Gemma3 VLM (google/gemma-3-12b-it)
+- Other vision-language models may work with minor adjustments
+
+## Tips for Memory/Performance
+
+**OOM Issues**: Use eager mode and reduce batch size
+```bash
+PT_HPU_LAZY_MODE=0 --per_device_train_batch_size 1
+```
+
+**Lower Throughput**: Use lazy mode for better performance
+```bash
+PT_HPU_LAZY_MODE=1 --use_lazy_mode
+```
+
+**Effective Batch Size**: `batch_size × num_cards × gradient_accumulation_steps`
+
