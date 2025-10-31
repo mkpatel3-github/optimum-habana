@@ -27,6 +27,7 @@ Key features:
 - Robust assistant-only labels via prompt-length masking
 - GaudiConfig support via gaudi_config_name in training args
 - Single and multi-card training via gaudi_spawn.py
+- Evaluation and validation support with metrics logging
 """
 
 import logging
@@ -421,6 +422,18 @@ def main():
     else:
         raise ValueError("You must specify a dataset_name")
 
+    # AUTO-SPLIT: Create validation split if doing eval but no validation exists
+    if training_args.do_eval and "validation" not in raw_datasets:
+        logger.warning(
+            f"Dataset '{data_args.dataset_name}' has no 'validation' split. "
+            f"Creating 80/20 train/validation split from training data (seed={training_args.seed})."
+        )
+        split_datasets = raw_datasets["train"].train_test_split(test_size=0.2, seed=training_args.seed)
+        raw_datasets["train"] = split_datasets["train"]
+        raw_datasets["validation"] = split_datasets["test"]
+        logger.info(f"Train split: {len(raw_datasets['train'])} samples")
+        logger.info(f"Validation split: {len(raw_datasets['validation'])} samples")
+
     if "train" not in raw_datasets:
         raise ValueError("Training requires a train split")
 
@@ -444,7 +457,7 @@ def main():
         train_dataset = train_dataset.shard(num_shards=world_size, index=rank)
         logger.info(f"[rank {rank}/{world_size}] Sharded train size: {len(train_dataset)}")
 
-    # Normalize dataset schema
+    # Normalize train dataset schema
     train_dataset = normalize_split(train_dataset)
 
     # Filter out examples with empty answers
@@ -454,6 +467,32 @@ def main():
 
     if is_main_process(training_args.local_rank):
         logger.info(f"[rank {rank}] Final train shard size after normalize+filter: {len(train_dataset)}")
+
+    # Load validation dataset if doing evaluation
+    eval_dataset = None
+    if training_args.do_eval:
+        if "validation" not in raw_datasets:
+            raise ValueError("Evaluation requires a validation split in the dataset")
+
+        eval_dataset = raw_datasets["validation"]
+
+        if data_args.max_eval_samples is not None:
+            max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
+            eval_dataset = eval_dataset.select(range(max_eval_samples))
+
+        if world_size > 1:
+            eval_dataset = eval_dataset.shard(num_shards=world_size, index=rank)
+
+        # Normalize eval dataset schema
+        eval_dataset = normalize_split(eval_dataset)
+
+        # Filter out examples with empty answers
+        eval_dataset = eval_dataset.filter(
+            lambda ex: isinstance(ex["answer"], str) and ex["answer"].strip() != ""
+        )
+
+        if is_main_process(training_args.local_rank):
+            logger.info(f"[rank {rank}] Eval dataset size after normalize+filter: {len(eval_dataset)}")
 
     # Load processor and model
     processor = AutoProcessor.from_pretrained(
@@ -541,6 +580,7 @@ def main():
         gaudi_config=gaudi_config,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
         processing_class=processor,
         data_collator=collate_fn,
     )
@@ -568,8 +608,27 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
+    # Evaluation
+    if training_args.do_eval:
+        logger.info("*** Evaluate ***")
+        metrics = trainer.evaluate()
+
+        max_eval_samples = (
+            data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+        )
+        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+
+        try:
+            perplexity = math.exp(metrics["eval_loss"])
+        except OverflowError:
+            perplexity = float("inf")
+        metrics["perplexity"] = perplexity
+
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+
     # Save processor
-    if training_args.do_train:
+    if training_args.do_train or training_args.do_eval:
         processor.save_pretrained(training_args.output_dir)
 
 
