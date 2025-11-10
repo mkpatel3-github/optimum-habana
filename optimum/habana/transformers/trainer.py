@@ -842,6 +842,34 @@ class GaudiTrainer(Trainer):
         # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model), etc.
         # FSDP(Transformers Model), Dynamo Optimized Module(Transformers Model) etc.
 
+        # Fix for DDP + Gradient Checkpointing incompatibility in multi-GPU training
+        # When gradient checkpointing is enabled with DDP, the reentrant backward pass causes
+        # DDP hooks to fire multiple times for the same parameters (especially LoRA params),
+        # leading to "Expected to mark a variable ready only once" RuntimeError.
+        # Solution: Enable static graph mode to inform DDP that computation graph won't change.
+        # Note: DeepSpeed is excluded as it has its own gradient checkpointing implementation
+        # that handles DDP synchronization differently.
+        if args.gradient_checkpointing and args.world_size > 1:
+            if self.is_deepspeed_enabled:
+                logger.info("Gradient checkpointing enabled with DeepSpeed - using DeepSpeed's built-in checkpointing")
+                logger.info("DeepSpeed handles DDP synchronization internally, no static graph needed")
+            else:
+                logger.info("Enabling DDP static graph for gradient checkpointing compatibility (MPI/native DDP)")
+                try:
+                    # The model is wrapped, access the DDP module
+                    if hasattr(self.model_wrapped, 'module'):
+                        # model_wrapped is DDP wrapper
+                        self.model_wrapped._set_static_graph()
+                        logger.info("Successfully enabled static graph on DDP-wrapped model")
+                    elif hasattr(self.model_wrapped, '_set_static_graph'):
+                        # model_wrapped has the method directly
+                        self.model_wrapped._set_static_graph()
+                        logger.info("Successfully enabled static graph on model")
+                    else:
+                        logger.warning("Could not find _set_static_graph method - skipping static graph setup")
+                except Exception as e:
+                    logger.warning(f"Failed to enable static graph: {e}")
+
         # Train!
         logger.info("***** Running training *****")
         logger.info(f"  Num examples = {num_examples:,}")
