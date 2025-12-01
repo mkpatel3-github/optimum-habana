@@ -49,6 +49,14 @@ from transformers import (
     Trainer,
 )
 
+# Optimum Habana imports for Gaudi-optimized models
+try:
+    from optimum.habana.transformers.models.llava_next import GaudiLlavaNextForConditionalGeneration
+    GAUDI_LLAVA_AVAILABLE = True
+except ImportError:
+    GAUDI_LLAVA_AVAILABLE = False
+    logging.warning("GaudiLlavaNextForConditionalGeneration not available - using base transformers model")
+
 # LoRA/PEFT
 from peft import get_peft_model, LoraConfig, TaskType
 
@@ -478,14 +486,26 @@ class MultimodalVLMTrainer:
             )
             logger.info(" Processor loaded")
             
-            # Load model (trust_remote_code removed for standard models)
-            model_cls = AutoModelForVision2Seq if self.model_config["model_class"] == "vision2seq" else AutoModelForCausalLM
-            self.model = model_cls.from_pretrained(
-                self.args.model_name_or_path,
-                torch_dtype=torch.bfloat16 if self.args.bf16 else torch.float32,
-                device_map="auto" if not HABANA_AVAILABLE else None,
-                low_cpu_mem_usage=True,
-            )
+            # Load model - use Gaudi-optimized version for LLaVA if available
+            is_llava = self.model_config.get("family") == "llava"
+            
+            if is_llava and GAUDI_LLAVA_AVAILABLE and HABANA_AVAILABLE:
+                logger.info("🔧 Loading Gaudi-optimized LLaVA model (GaudiLlavaNextForConditionalGeneration)")
+                self.model = GaudiLlavaNextForConditionalGeneration.from_pretrained(
+                    self.args.model_name_or_path,
+                    torch_dtype=torch.bfloat16 if self.args.bf16 else torch.float32,
+                    device_map=None,  # Gaudi doesn't use device_map
+                    low_cpu_mem_usage=True,
+                )
+            else:
+                # Use standard AutoModel for other models
+                model_cls = AutoModelForVision2Seq if self.model_config["model_class"] == "vision2seq" else AutoModelForCausalLM
+                self.model = model_cls.from_pretrained(
+                    self.args.model_name_or_path,
+                    torch_dtype=torch.bfloat16 if self.args.bf16 else torch.float32,
+                    device_map="auto" if not HABANA_AVAILABLE else None,
+                    low_cpu_mem_usage=True,
+                )
             
             # Disable cache for training (required for gradient checkpointing)
             self.model.config.use_cache = False
@@ -955,6 +975,34 @@ def main():
                         help="Local rank for distributed training (set by DeepSpeed/torch.distributed.launch)")
     
     args = parser.parse_args()
+    
+    # WORKAROUND: Disable gradient checkpointing for BS=1 + DDP due to PyTorch DDP reducer bug
+    # See: https://github.com/pytorch/pytorch/issues/reducer.cpp:1633
+    if args.gradient_checkpointing and args.per_device_train_batch_size == 1:
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        if world_size > 1:  # DDP is active
+            logger.warning(
+                f"⚠️  WORKAROUND: Disabling gradient_checkpointing for BS=1 with DDP (world_size={world_size})"
+            )
+            logger.warning(
+                f"    Reason: PyTorch DDP has a bug (reducer.cpp:1633) when combining:"
+            )
+            logger.warning(
+                f"    - Batch size = 1 per device"
+            )
+            logger.warning(
+                f"    - Gradient checkpointing enabled"
+            )
+            logger.warning(
+                f"    - Multi-GPU training (DDP)"
+            )
+            logger.warning(
+                f"    Solution: Either increase --per_device_train_batch_size >= 2, or disable --gradient_checkpointing"
+            )
+            logger.warning(
+                f"    Automatically setting gradient_checkpointing=False for this run."
+            )
+            args.gradient_checkpointing = False
     
     # Run training
     trainer = MultimodalVLMTrainer(args)
