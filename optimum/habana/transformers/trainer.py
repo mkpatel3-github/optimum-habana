@@ -849,6 +849,15 @@ class GaudiTrainer(Trainer):
             # Remove FSDP wrapping from sub-models.
             self.model = unwrap_model(self.model, recursive=True)
 
+        skip_static_graph_for_large_microbatch = (
+            args.per_device_train_batch_size > 1 and args.gradient_accumulation_steps > 1
+        )
+        if skip_static_graph_for_large_microbatch and self._ddp_static_graph_should_apply:
+            logger.warning(
+                "[DDP FIX] Skipping static graph workaround because BS>1 and GA>1 "
+                "(known PyTorch reducer.cpp:1633 bug for large effective batch sizes)."
+            )
+
         if delay_optimizer_creation:
             if use_accelerator_prepare:
                 # configure fsdp plugin for qlora if any
@@ -891,7 +900,7 @@ class GaudiTrainer(Trainer):
             logger.info(
                 f"[DDP DEBUG] Checking fix conditions: GC={args.gradient_checkpointing}, WS={args.world_size}, DeepSpeed={self.is_deepspeed_enabled}"
             )
-            if self._ddp_static_graph_should_apply:
+            if self._ddp_static_graph_should_apply and not skip_static_graph_for_large_microbatch:
                 logger.info("[DDP DEBUG] Checking fix conditions: GC=True, WS=8, DeepSpeed=False")
                 if args.gradient_checkpointing and args.world_size > 1 and not self.is_deepspeed_enabled:
                     logger.info("[DDP FIX] ✓ All conditions met - applying DDP static graph fix")
@@ -934,6 +943,7 @@ class GaudiTrainer(Trainer):
             # If model was wrapped by _wrap_model and we have the conditions, apply fix here
             if (
                 self._ddp_static_graph_should_apply
+                and not skip_static_graph_for_large_microbatch
                 and args.gradient_checkpointing
                 and args.world_size > 1
                 and not self.is_deepspeed_enabled
