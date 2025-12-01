@@ -1,1 +1,1 @@
-from .modeling_llava_next import GaudiLlavaNextForConditionalGeneration
+from .modeling_llava_next import GaudiLlavaNextForConditionalGeneration, GaudiLlavaNextModel

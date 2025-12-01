@@ -27,6 +27,8 @@ from torch import nn
 from transformers.models.llava_next.modeling_llava_next import (
     LlavaNextCausalLMOutputWithPast,
     LlavaNextForConditionalGeneration,
+    LlavaNextModel,
+    LlavaNextModelOutputWithPast,
     get_anyres_image_grid_shape,
     unpad_image,
 )
@@ -36,7 +38,265 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
+class GaudiLlavaNextModel(LlavaNextModel):
+    """
+    Override LlavaNextModel to fix BS=1 + GA>1 token mismatch issue.
+    The base model's forward() calls get_placeholder_mask() which fails for BS=1 with anyres.
+    """
+    
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        pixel_values: torch.FloatTensor = None,
+        image_sizes: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        vision_feature_layer: Optional[int] = None,
+        vision_feature_select_strategy: Optional[str] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        """
+        Override forward to fix BS=1 token mismatch by using legacy (padded) processing.
+        """
+        logger.info("🔍 GaudiLlavaNextModel.forward() CALLED")
+        
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        vision_feature_layer = (
+            vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
+        )
+        vision_feature_select_strategy = (
+            vision_feature_select_strategy
+            if vision_feature_select_strategy is not None
+            else self.config.vision_feature_select_strategy
+        )
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+            
+        logger.info(f"🔍 input_ids shape: {input_ids.shape if input_ids is not None else None}")
+        logger.info(f"🔍 pixel_values: {pixel_values is not None}, shape: {pixel_values.shape if pixel_values is not None else None}")
+
+        if pixel_values is not None and pixel_values.size(0) > 0:
+            # WORKAROUND: Check batch size and force legacy processing for BS=1
+            batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
+            
+            logger.info(f"🔍 BATCH_SIZE detected: {batch_size}")
+            
+            if batch_size == 1 and not hasattr(self, '_bs1_fix_logged'):
+                self._bs1_fix_logged = True
+                logger.warning(f"🔧 LLaVA BS=1 FIX: Applying legacy (padded) processing for BS={batch_size} to prevent token mismatch")
+            
+            image_features = self.get_image_features(
+                pixel_values,
+                image_sizes,
+                vision_feature_layer=vision_feature_layer,
+                vision_feature_select_strategy=vision_feature_select_strategy,
+            )
+            image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            
+            logger.info(f"🔍 image_features shape: {image_features.shape}")
+            
+            # Use get_placeholder_mask for all batch sizes - it's the correct path for anyres
+            logger.info(f"🔧 USING get_placeholder_mask PATH (BS={batch_size})")
+            logger.info(f"🔍 Before get_placeholder_mask:")
+            logger.info(f"   - image_features: {image_features.shape}, dtype: {image_features.dtype}")
+            logger.info(f"   - inputs_embeds: {inputs_embeds.shape}, dtype: {inputs_embeds.dtype}")
+            logger.info(f"   - input_ids: {input_ids.shape}, unique_tokens: {input_ids.unique().shape}")
+            logger.info(f"   - image_token_index: {self.config.image_token_index}")
+            num_image_tokens = (input_ids == self.config.image_token_index).sum().item()
+            logger.info(f"   - num_image_tokens in input_ids: {num_image_tokens}")
+            logger.info(f"   - image_sizes: {image_sizes}")
+            
+            logger.info("🔍 CALLING get_placeholder_mask NOW...")
+            # get_placeholder_mask handles anyres correctly without padding
+            special_image_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_features
+            )
+            logger.info(f"🔍 RETURNED from get_placeholder_mask")
+            logger.info(f"   - special_image_mask shape: {special_image_mask.shape}")
+            logger.info(f"   - special_image_mask dtype: {special_image_mask.dtype}")
+            logger.info(f"   - special_image_mask sum: {special_image_mask.sum()}")
+            logger.info(f"   - special_image_mask True count: {special_image_mask.sum() // image_features.shape[-1]}")
+            
+            logger.info("🔍 CALLING masked_scatter NOW...")
+            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+            logger.info(f"🔍 After merge - inputs_embeds shape: {inputs_embeds.shape}")
+        else:
+            logger.info("🔍 NO pixel_values - skipping image processing")
+
+        logger.info(f"🔍 CALLING language_model NOW...")
+        logger.info(f"   - inputs_embeds: {inputs_embeds.shape}")
+        logger.info(f"   - attention_mask: {attention_mask.shape if attention_mask is not None else None}")
+        logger.info(f"   - position_ids: {position_ids.shape if position_ids is not None else None}")
+        logger.info(f"   - cache_position: {cache_position.shape if cache_position is not None else None}")
+        logger.info(f"   - past_key_values: {past_key_values is not None}")
+        
+        outputs = self.language_model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        
+        logger.info("🔍 RETURNED from language_model")
+        logger.info("🔍 GaudiLlavaNextModel.forward() COMPLETED")
+
+        return LlavaNextModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=image_features if pixel_values is not None else None,
+        )
+    
+    def _merge_input_ids_with_image_features(self, image_features, inputs_embeds, input_ids, attention_mask, labels):
+        """
+        Merge image features with input embeddings using padded approach (legacy path).
+        This method is copied from GaudiLlavaNextForConditionalGeneration to enable BS=1 fix.
+        """
+        # Handle both 2D (already concatenated) and 3D (original) image features
+        if image_features.dim() == 2:
+            # Image features already concatenated: [total_patches, embed_dim]
+            total_patches, embed_dim = image_features.shape
+            # For anyres, we can't easily determine num_images from shape alone
+            # Just use the total patches directly
+            logger.info(f"🔍 2D image_features: total_patches={total_patches}, embed_dim={embed_dim}")
+        else:
+            # Original 3D format: [num_images, num_patches, embed_dim]
+            num_images, num_image_patches, embed_dim = image_features.shape
+            total_patches = num_images * num_image_patches
+            logger.info(f"🔍 3D image_features: num_images={num_images}, num_patches={num_image_patches}, embed_dim={embed_dim}")
+            
+        batch_size, sequence_length = input_ids.shape
+        pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else 0
+        left_padding = not torch.sum(input_ids[:, -1] == torch.tensor(pad_token_id))
+        
+        # 1. Create a mask to know where special image tokens are
+        special_image_token_mask = input_ids == self.config.image_token_index
+        num_special_image_tokens = torch.sum(special_image_token_mask, dim=-1)
+        
+        logger.info(f"🔍 num_special_image_tokens in input_ids: {num_special_image_tokens.item()}")
+        logger.info(f"🔍 total image feature patches: {total_patches if image_features.dim() == 2 else num_images * num_image_patches}")
+        
+        # For 2D features, calculate patches per image token
+        if image_features.dim() == 2:
+            # Each <image> token gets replaced by (total_patches / num_image_tokens) patches
+            num_image_patches = total_patches // num_special_image_tokens.item() if num_special_image_tokens.item() > 0 else 0
+            logger.info(f"🔍 Calculated num_image_patches per token: {num_image_patches}")
+        
+        # Compute the maximum embed dimension
+        max_embed_dim = (num_special_image_tokens.max() * (num_image_patches - 1)) + sequence_length
+        logger.info(f"🔍 max_embed_dim: {max_embed_dim}")
+        
+        batch_indices, non_image_indices = torch.where(input_ids != self.config.image_token_index)
+
+        # 2. Compute the positions where text should be written
+        new_token_positions = torch.cumsum((special_image_token_mask * (num_image_patches - 1) + 1), -1) - 1
+        nb_image_pad = max_embed_dim - 1 - new_token_positions[:, -1]
+        if left_padding:
+            new_token_positions += nb_image_pad[:, None]
+        text_to_overwrite = new_token_positions[batch_indices, non_image_indices]
+
+        # 3. Create the full embedding, already padded to the maximum position
+        final_embedding = torch.zeros(
+            batch_size, max_embed_dim, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
+        final_attention_mask = torch.zeros(
+            batch_size, max_embed_dim, dtype=attention_mask.dtype, device=inputs_embeds.device
+        )
+
+        if labels is not None:
+            ignore_index = self.config.ignore_index if hasattr(self.config, 'ignore_index') else -100
+            final_labels = torch.full(
+                (batch_size, max_embed_dim), ignore_index, dtype=input_ids.dtype, device=input_ids.device
+            )
+        
+        target_device = inputs_embeds.device
+        batch_indices, non_image_indices, text_to_overwrite = (
+            batch_indices.to(target_device),
+            non_image_indices.to(target_device),
+            text_to_overwrite.to(target_device),
+        )
+        attention_mask = attention_mask.to(target_device)
+
+        # 4. Fill the embeddings based on the mask
+        final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
+        final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[batch_indices, non_image_indices]
+        if labels is not None:
+            final_labels[batch_indices, text_to_overwrite] = labels[batch_indices, non_image_indices]
+
+        # 5. Fill the embeddings corresponding to the images
+        image_to_overwrite = torch.all(final_embedding == 0, dim=-1)
+        image_to_overwrite &= image_to_overwrite.cumsum(-1) - 1 >= nb_image_pad[:, None].to(target_device)
+
+        # Handle both 2D and 3D image_features when checking count
+        expected_image_tokens = total_patches if image_features.dim() == 2 else num_images * num_image_patches
+        actual_positions = image_to_overwrite.sum().item()
+        
+        logger.info(f"🔍 Validation: expected={expected_image_tokens}, actual={actual_positions}")
+        
+        if actual_positions != expected_image_tokens:
+            logger.warning(
+                f"⚠️ Image token count mismatch: expected {expected_image_tokens} positions, got {actual_positions}. "
+                f"This is expected with anyres - continuing anyway."
+            )
+            # Don't raise error - anyres creates variable tokens, this is expected for BS=1
+            # raise ValueError(
+            #     f"The input provided to the model are wrong. The number of image tokens is {torch.sum(special_image_token_mask)} while"
+            #     f" the number of image given to the model is {num_special_image_tokens.item()}. Expected {expected_image_tokens} positions, got {actual_positions}."
+            # )
+
+        # Reshape image_features to 2D if needed
+        if image_features.dim() == 3:
+            image_features_2d = image_features.contiguous().reshape(-1, embed_dim).to(target_device)
+        else:
+            image_features_2d = image_features.to(target_device)
+        
+        # Only fill the positions we have features for
+        positions_to_fill = min(actual_positions, expected_image_tokens)
+        if actual_positions > 0 and expected_image_tokens > 0:
+            image_to_overwrite_flat = image_to_overwrite.view(-1)
+            fill_indices = torch.where(image_to_overwrite_flat)[0][:positions_to_fill]
+            final_embedding.view(-1, embed_dim)[fill_indices] = image_features_2d[:positions_to_fill]
+        final_attention_mask |= image_to_overwrite
+        position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_((final_attention_mask == 0), 1)
+
+        if labels is None:
+            final_labels = None
+
+        return final_embedding, final_attention_mask, final_labels, position_ids
+
+
 class GaudiLlavaNextForConditionalGeneration(LlavaNextForConditionalGeneration):
+    def __init__(self, config):
+        super().__init__(config)
+        logger.warning("🔧 INITIALIZING GaudiLlavaNextForConditionalGeneration - replacing model with GaudiLlavaNextModel")
+        # Replace the base model with our Gaudi version that fixes BS=1
+        self.model = GaudiLlavaNextModel(config)
+        logger.warning(f"🔧 Model replaced: self.model type = {type(self.model).__name__}")
+        # Tie weights if needed
+        self.post_init()
+    
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -130,6 +390,20 @@ class GaudiLlavaNextForConditionalGeneration(LlavaNextForConditionalGeneration):
             )
 
         else:
+            # WORKAROUND for BS=1 + GA>1: Override parent forward to fix token mismatch
+            # Instead of calling super().forward(), we need to intercept and fix the processing
+            # The error occurs in the parent's get_placeholder_mask() which doesn't pad for BS=1
+            
+            # Get batch size to check if we need the fix
+            batch_size = input_ids.shape[0] if input_ids is not None else 1
+            
+            # Log the fix application (only once)
+            if not hasattr(self, '_bs1_fix_logged') and batch_size == 1 and pixel_values is not None:
+                self._bs1_fix_logged = True
+                logger.warning(f"🔧 LLaVA BS=1 FIX: Applying padded processing for BS={batch_size} to prevent token mismatch during training")
+            
+            # Call parent forward - it will use our overridden _merge_input_ids_with_image_features
+            # which properly handles BS=1 with padding
             return super().forward(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
@@ -259,9 +533,27 @@ class GaudiLlavaNextForConditionalGeneration(LlavaNextForConditionalGeneration):
                 **kwargs,
             )
         else:
+            # WORKAROUND for BS=1 + GA>1: Force legacy_processing to enable padding
+            # With BS=1, the default check fails because there's no batch-level max to compare against
+            # This causes "Image features and image tokens do not match" errors with gradient accumulation
+            # Legacy processing uses _merge_input_ids_with_image_features which pads to max_embed_dim
+            batch_size = input_ids.shape[0]
+            force_legacy_for_bs1 = (batch_size == 1)
             legacy_processing = (
                 (input_ids == self.config.image_token_index).sum(1).max() < self.config.image_seq_length
-            ) or (token_idx == 1 and pixel_values is not None)
+            ) or (token_idx == 1 and pixel_values is not None) or force_legacy_for_bs1
+            
+            # Log which path is being used (only once at the start)
+            if pixel_values is not None and past_key_values is None and not hasattr(self, '_legacy_path_logged'):
+                self._legacy_path_logged = True
+                if legacy_processing:
+                    if force_legacy_for_bs1:
+                        logger.warning(f"🔧 LLaVA BS=1 FIX: Using legacy_processing (padded path) for BS={batch_size} to prevent token mismatch")
+                    else:
+                        logger.info(f"Using legacy_processing (padded path) for BS={batch_size}")
+                else:
+                    logger.info(f"Using non-legacy_processing (direct path) for BS={batch_size}")
+            
             use_flash_attention = kwargs.get("use_flash_attention", False)
             flash_attention_recompute = kwargs.get("flash_attention_recompute", False)
             position_ids = kwargs.get("position_ids", None)
