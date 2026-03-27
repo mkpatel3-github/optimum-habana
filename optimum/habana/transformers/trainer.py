@@ -275,6 +275,9 @@ class GaudiTrainer(Trainer):
         else:
             self.gaudi_config = copy.deepcopy(gaudi_config)
 
+        # Initialize DDP static graph flag
+        self._ddp_static_graph_should_apply = False
+
         if self.args.use_habana:
             if self.args.use_hpu_graphs_for_inference:
                 self.already_wrapped_for_hpu_graphs = False
@@ -479,7 +482,12 @@ class GaudiTrainer(Trainer):
         if not training:
             return model
 
+        if training:
+            # Reset static-graph flag each time we (re)wrap the model for training.
+            self._ddp_static_graph_should_apply = False
+
         if self.args.parallel_mode == ParallelMode.DISTRIBUTED and self.args.distribution_strategy == "ddp":
+            # Default to not applying the static-graph fix unless we explicitly enable it below.
             kwargs = {}
 
             if self.args.ddp_find_unused_parameters is not None:
@@ -502,8 +510,33 @@ class GaudiTrainer(Trainer):
             if self.args.use_habana:
                 kwargs["gradient_as_bucket_view"] = True
 
+            if self.args.gradient_checkpointing and self.args.world_size > 1 and not self.is_deepspeed_enabled:
+                if self.args.ddp_find_unused_parameters is True:
+                    if not kwargs.get("static_graph", False):
+                        logger.info(
+                            "[DDP FIX] ddp_find_unused_parameters=True with gradient_checkpointing - enabling static_graph for stable reducer hooks"
+                        )
+                        kwargs["static_graph"] = True
+                    self._ddp_static_graph_should_apply = True
+                else:
+                    if kwargs.get("find_unused_parameters", True):
+                        logger.info(
+                            "[DDP FIX] Overriding DDP find_unused_parameters=False to pair with static graph and gradient checkpointing"
+                        )
+                        kwargs["find_unused_parameters"] = False
+                    if not kwargs.get("static_graph", False):
+                        logger.info("[DDP FIX] Enabling DDP static_graph flag for gradient checkpointing compatibility")
+                        kwargs["static_graph"] = True
+                    self._ddp_static_graph_should_apply = True
+
             if self.args.ddp_broadcast_buffers is not None:
                 kwargs["broadcast_buffers"] = self.args.ddp_broadcast_buffers
+
+            if self.accelerator.is_local_main_process:
+                logger.info(
+                    "[DDP DEBUG] Final DDP kwargs before prepare: %s",
+                    {key: kwargs[key] for key in sorted(kwargs.keys())},
+                )
 
             self.accelerator.ddp_handler = DistributedDataParallelKwargs(**kwargs)
 
@@ -546,6 +579,8 @@ class GaudiTrainer(Trainer):
         args = self.args
 
         self.is_in_train = True
+        self._ddp_grad_debug_logged = False
+        self._ddp_grad_debug_counter = 0
 
         # Attach NEFTune hooks if necessary
         if self.neftune_noise_alpha is not None:
@@ -722,6 +757,15 @@ class GaudiTrainer(Trainer):
 
         # Activate gradient checkpointing if needed
         if args.gradient_checkpointing:
+            if args.world_size > 1 and not self.is_deepspeed_enabled:
+                gc_kwargs = args.gradient_checkpointing_kwargs or {}
+                if gc_kwargs.get("use_reentrant", True):
+                    gc_kwargs = dict(gc_kwargs)
+                    gc_kwargs["use_reentrant"] = False
+                    args.gradient_checkpointing_kwargs = gc_kwargs
+                    logger.info(
+                        "[DDP FIX] Forcing gradient_checkpointing_kwargs['use_reentrant']=False to avoid DDP hook collisions"
+                    )
             import transformers.modeling_utils
 
             if args.deepspeed:
@@ -754,6 +798,28 @@ class GaudiTrainer(Trainer):
 
                 torch.utils.checkpoint.checkpoint = lazy_mode_checkpointing
                 transformers.modeling_utils.checkpoint = lazy_mode_checkpointing
+            else:
+                # Default path: ensure the non-reentrant checkpoint is used unless explicitly overridden.
+                # Many transformer models call torch.utils.checkpoint without passing kwargs, so we wrap it here.
+                import torch.utils.checkpoint as torch_checkpoint_module
+
+                if getattr(torch_checkpoint_module.checkpoint, "__name__", "") != "hpu_non_reentrant_checkpoint":
+                    torch_checkpoint = torch_checkpoint_module.checkpoint
+
+                    def hpu_non_reentrant_checkpoint(function, *checkpoint_args, use_reentrant=None, **checkpoint_kwargs):
+                        if use_reentrant is None:
+                            use_reentrant = False
+                        return torch_checkpoint(
+                            function,
+                            *checkpoint_args,
+                            use_reentrant=use_reentrant,
+                            **checkpoint_kwargs,
+                        )
+
+                    hpu_non_reentrant_checkpoint.__name__ = "hpu_non_reentrant_checkpoint"
+                    logger.info("[DDP FIX] Wrapping torch.utils.checkpoint to default use_reentrant=False")
+                    torch_checkpoint_module.checkpoint = hpu_non_reentrant_checkpoint
+                    transformers.modeling_utils.checkpoint = hpu_non_reentrant_checkpoint
 
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
 
@@ -766,16 +832,31 @@ class GaudiTrainer(Trainer):
                 self.model.gradient_checkpointing_disable()
 
         model = self._wrap_model(self.model_wrapped)
+        
+        logger.info(f"[DDP DEBUG] After _wrap_model: model type = {type(model).__name__}")
+        logger.info(f"[DDP DEBUG] model is self.model? {model is self.model}")
+        logger.info(f"[DDP DEBUG] model_wrapped type = {type(self.model_wrapped).__name__}")
 
         # as the model is wrapped, don't use `accelerator.prepare`
         # this is for unhandled cases such as
         # FSDP-XLA, SageMaker MP/DP, DataParallel, IPEX
         use_accelerator_prepare = model is self.model
+        
+        logger.info(f"[DDP DEBUG] use_accelerator_prepare = {use_accelerator_prepare}")
 
         if use_accelerator_prepare and self.is_fsdp_enabled:
             # In case of auto_find_batch_size=True
             # Remove FSDP wrapping from sub-models.
             self.model = unwrap_model(self.model, recursive=True)
+
+        skip_static_graph_for_large_microbatch = (
+            args.per_device_train_batch_size > 1 and args.gradient_accumulation_steps > 1
+        )
+        if skip_static_graph_for_large_microbatch and self._ddp_static_graph_should_apply:
+            logger.warning(
+                "[DDP FIX] Skipping static graph workaround because BS>1 and GA>1 "
+                "(known PyTorch reducer.cpp:1633 bug for large effective batch sizes)."
+            )
 
         if delay_optimizer_creation:
             if use_accelerator_prepare:
@@ -787,19 +868,99 @@ class GaudiTrainer(Trainer):
 
         # prepare using `accelerator` prepare
         if use_accelerator_prepare:
+            logger.info(f"[DDP DEBUG] BEFORE accelerator.prepare: self.model type = {type(self.model).__name__}")
+            logger.info(f"[DDP DEBUG] gradient_checkpointing = {args.gradient_checkpointing}, world_size = {args.world_size}, deepspeed = {self.is_deepspeed_enabled}")
+            logger.info(f"[DDP DEBUG] is_tp_enabled = {self.is_tp_enabled}")
+            
             self.model.train()
             if hasattr(self.lr_scheduler, "step"):
                 # We should avoid accelerate preparing the model in TP case since we dont need it as it is handled by transformers from_pretrained and also it goes into DDP based preparation.
                 if self.is_tp_enabled:
+                    logger.info(f"[DDP DEBUG] TP enabled - only preparing optimizer")
                     self.optimizer = self.accelerator.prepare(self.optimizer)
                 else:
+                    logger.info(f"[DDP DEBUG] Preparing model + optimizer with accelerator")
                     model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+                    logger.info(f"[DDP DEBUG] AFTER accelerator.prepare: model type = {type(model).__name__}")
             else:
                 # to handle cases wherein we pass "DummyScheduler" such as when it is specified in DeepSpeed config.
+                logger.info(f"[DDP DEBUG] Preparing model + optimizer + scheduler with accelerator")
                 model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
                     self.model, self.optimizer, self.lr_scheduler
                 )
-        elif self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+                logger.info(f"[DDP DEBUG] AFTER accelerator.prepare: model type = {type(model).__name__}")
+            
+            # Fix for DDP + Gradient Checkpointing incompatibility
+            # CRITICAL: Apply AFTER accelerator.prepare() which wraps the model in DDP
+            # When gradient checkpointing is enabled with DDP, the reentrant backward pass causes
+            # DDP hooks to fire multiple times for the same parameters (especially LoRA params),
+            # leading to "Expected to mark a variable ready only once" RuntimeError.
+            # Solution: Enable static graph mode to inform DDP that computation graph won't change.
+            # Note: DeepSpeed is excluded as it has its own gradient checkpointing implementation.
+            logger.info(
+                f"[DDP DEBUG] Checking fix conditions: GC={args.gradient_checkpointing}, WS={args.world_size}, DeepSpeed={self.is_deepspeed_enabled}"
+            )
+            if self._ddp_static_graph_should_apply and not skip_static_graph_for_large_microbatch:
+                logger.info("[DDP DEBUG] Checking fix conditions: GC=True, WS=8, DeepSpeed=False")
+                if args.gradient_checkpointing and args.world_size > 1 and not self.is_deepspeed_enabled:
+                    logger.info("[DDP FIX] ✓ All conditions met - applying DDP static graph fix")
+                    logger.info(f"[DDP FIX] Model type before fix: {type(model).__name__}")
+                    logger.info(f"[DDP FIX] Has _set_static_graph: {hasattr(model, '_set_static_graph')}")
+                    logger.info(f"[DDP FIX] Has module attr: {hasattr(model, 'module')}")
+                    logger.info(f"[DDP FIX] Model class: {model.__class__.__module__}.{model.__class__.__name__}")
+
+                    try:
+                        # After accelerator.prepare(), 'model' variable contains the DDP-wrapped model
+                        if hasattr(model, '_set_static_graph'):
+                            logger.info("[DDP FIX] Calling model._set_static_graph()...")
+                            model._set_static_graph()
+                            logger.info(f"[DDP FIX] ✓✓✓ SUCCESS! Static graph enabled on {type(model).__name__}")
+                        else:
+                            logger.error(
+                                f"[DDP FIX] ✗✗✗ FAILED! Model type {type(model).__name__} does not have _set_static_graph method"
+                            )
+                            logger.error(f"[DDP FIX] This means the model is NOT a DistributedDataParallel instance!")
+                            logger.error(f"[DDP FIX] Model MRO: {[c.__name__ for c in type(model).__mro__]}")
+                    except Exception as e:
+                        logger.error(f"[DDP FIX] ✗✗✗ Exception while enabling static graph: {e}")
+                        import traceback
+
+                        logger.error(f"[DDP FIX] Traceback: {traceback.format_exc()}")
+                else:
+                    logger.info(f"[DDP FIX] ✗ Conditions NOT met - skipping fix")
+                    if not args.gradient_checkpointing:
+                        logger.info("[DDP FIX]   Reason: gradient_checkpointing=False")
+                    if args.world_size <= 1:
+                        logger.info(f"[DDP FIX]   Reason: world_size={args.world_size} (need >1)")
+                    if self.is_deepspeed_enabled:
+                        logger.info("[DDP FIX]   Reason: DeepSpeed is enabled")
+        elif not use_accelerator_prepare:
+            logger.warning("[DDP DEBUG] use_accelerator_prepare=False - skipping accelerator.prepare() block entirely!")
+            logger.warning("[DDP DEBUG] This means model was already wrapped by _wrap_model()")
+            logger.warning(f"[DDP DEBUG] model type = {type(model).__name__}")
+            logger.warning(f"[DDP DEBUG] Has _set_static_graph: {hasattr(model, '_set_static_graph')}")
+
+            # If model was wrapped by _wrap_model and we have the conditions, apply fix here
+            if (
+                self._ddp_static_graph_should_apply
+                and not skip_static_graph_for_large_microbatch
+                and args.gradient_checkpointing
+                and args.world_size > 1
+                and not self.is_deepspeed_enabled
+            ):
+                logger.info("[DDP FIX ALTERNATIVE PATH] Conditions met, attempting to apply fix on pre-wrapped model")
+                if hasattr(model, '_set_static_graph'):
+                    try:
+                        model._set_static_graph()
+                        logger.info(
+                            f"[DDP FIX ALTERNATIVE PATH] ✓✓✓ SUCCESS! Static graph enabled on {type(model).__name__}"
+                        )
+                    except Exception as e:
+                        logger.error(f"[DDP FIX ALTERNATIVE PATH] ✗✗✗ Failed: {e}")
+                else:
+                    logger.error(f"[DDP FIX ALTERNATIVE PATH] ✗✗✗ Model {type(model).__name__} does not have _set_static_graph")
+        
+        if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
             # In this case we are in DDP + LOMO, which should be supported
             self.optimizer = self.accelerator.prepare(self.optimizer)
 
@@ -1004,8 +1165,24 @@ class GaudiTrainer(Trainer):
                         start_time_after_warmup = time.time()
 
                     do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == steps_in_epoch
-                    # Since we perform prefetching, we need to manually set sync_gradients
-                    self.accelerator.gradient_state._set_sync_gradients(do_sync_step)
+                    # Force sync on every micro-batch ONLY when BOTH ddp_find_unused_parameters AND gradient_checkpointing are enabled
+                    # to prevent DDP hook collision issues with reentrant gradient checkpointing.
+                    # When only ddp_find_unused_parameters=True (without GC), normal GA sync is sufficient.
+                    force_sync_for_ddp_gc = bool(getattr(self.args, "ddp_find_unused_parameters", False)) and args.gradient_checkpointing
+                    if self.accelerator.is_local_main_process and step < 10:
+                        logger.debug(
+                            "[DDP DEBUG] Rank %s micro-batch %s/%s (global_step=%s): do_sync_step=%s force_sync_for_ddp_gc=%s",
+                            self.accelerator.state.process_index,
+                            i,
+                            max(len(batch_samples) - 1, 0),
+                            self.state.global_step,
+                            do_sync_step,
+                            force_sync_for_ddp_gc,
+                        )
+                    # Since we perform prefetching, we need to manually set sync_gradients. When find_unused_parameters
+                    # AND gradient_checkpointing are BOTH enabled, keep gradients synchronized on every micro-batch
+                    # to avoid missing DDP hooks during reentrant backward passes.
+                    self.accelerator.gradient_state._set_sync_gradients(do_sync_step or force_sync_for_ddp_gc)
 
                     if self.args.include_num_input_tokens_seen:
                         main_input_name = getattr(self.model, "main_input_name", "input_ids")
@@ -1045,11 +1222,29 @@ class GaudiTrainer(Trainer):
 
                     # TODO: keep syncs for fast DDP?
                     # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
-                    context = (
-                        functools.partial(self.accelerator.no_sync, model=model)
-                        if i != len(batch_samples) - 1
+                    # Use no_sync for intermediate gradient accumulation steps, except when BOTH
+                    # ddp_find_unused_parameters AND gradient_checkpointing are enabled (to avoid DDP hook issues)
+                    should_no_sync = (
+                        i != len(batch_samples) - 1
                         and self.accelerator.distributed_type != DistributedType.DEEPSPEED
-                        else contextlib.nullcontext
+                        and not (bool(getattr(self.args, "ddp_find_unused_parameters", False)) and args.gradient_checkpointing)
+                    )
+                    if (
+                        self.accelerator.is_local_main_process
+                        and step < 10
+                        and i != len(batch_samples) - 1
+                    ):
+                        logger.debug(
+                            "[DDP DEBUG] Rank %s micro-batch %s/%s using %s (ddp_find_unused_parameters=%s, gradient_checkpointing=%s)",
+                            self.accelerator.state.process_index,
+                            i,
+                            len(batch_samples) - 1,
+                            "no_sync" if should_no_sync else "full_sync",
+                            getattr(self.args, "ddp_find_unused_parameters", False),
+                            args.gradient_checkpointing,
+                        )
+                    context = (
+                        functools.partial(self.accelerator.no_sync, model=model) if should_no_sync else contextlib.nullcontext
                     )
                     with context():
                         tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
@@ -1780,6 +1975,21 @@ class GaudiTrainer(Trainer):
                     self.accelerator.backward(loss, **kwargs)
             else:
                 self.accelerator.backward(loss, **kwargs)
+
+        if (
+            getattr(self.args, "ddp_find_unused_parameters", False)
+            and self.accelerator.is_local_main_process
+            and getattr(self, "_ddp_grad_debug_counter", 0) < 5
+        ):
+            missing_grads = [name for name, param in model.named_parameters() if param.requires_grad and param.grad is None]
+            logger.debug(
+                "[DDP DEBUG] Missing gradients after backward (check %s): %s",
+                self._ddp_grad_debug_counter,
+                missing_grads[:20],
+            )
+            if len(missing_grads) > 20:
+                logger.debug("[DDP DEBUG] ... %s more parameters without gradients", len(missing_grads) - 20)
+            self._ddp_grad_debug_counter += 1
 
         return loss.detach()
 
